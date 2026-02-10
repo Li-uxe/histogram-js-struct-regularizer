@@ -44,13 +44,14 @@ CFG = {
     # soft histogram shaping
     "tau": 1.0,
     "hist_sigma": 0.55,
-    "struct_moment_weight": 0.02,
+    "struct_moment_weight": 0.1,
     "struct_moment_beta": 2.0,
     "struct_loss_auto_scale": True,
     "struct_loss_scale_min": 0.25,
     "struct_loss_scale_max": 2.0,
     "hub_penalty_weight": 0.5,
     "hub_penalty_alpha_start": 5.0,
+    "density_penalty_weight": 0.2,
 
     # structure branch: smooth squash to avoid hard clamp zero-grad zones
     "struct_logit_clip": 6.0,
@@ -80,6 +81,7 @@ STEP_METRIC_COLUMNS = [
     "L_struct_total",
     "L_struct_scaled",
     "hub_penalty",
+    "density_penalty",
     "JS_soft",
     "moment_mean",
     "moment_std",
@@ -460,9 +462,10 @@ def compute_L_struct_global(
         h_gen  = hard_histogram(x_gen,  bin_edges)
 
     js = js_divergence(h_real, h_gen)
-    m_mean = F.smooth_l1_loss(deg_gen.mean(), deg_real.mean(), beta=moment_beta)
-    m_std = F.smooth_l1_loss(
-        deg_gen.std(unbiased=False), deg_real.std(unbiased=False), beta=moment_beta
+    _ = moment_beta  # kept for backward compatibility in CLI/config.
+    m_mean = F.mse_loss(deg_gen.mean(), deg_real.mean())
+    m_std = F.mse_loss(
+        deg_gen.std(unbiased=False), deg_real.std(unbiased=False)
     )
     l_total = js + moment_weight * (m_mean + 0.5 * m_std)
     return l_total, js, m_mean, m_std, h_real.detach(), h_gen.detach()
@@ -476,8 +479,15 @@ def compute_hub_penalty(deg_real, deg_gen, top_ratio=0.01):
     gen_top = torch.topk(deg_gen, k_gen).values
     real_share = real_top.sum() / (deg_real.sum() + 1e-12)
     gen_share = gen_top.sum() / (deg_gen.sum() + 1e-12)
-    # Only penalize over-concentrated hubs.
-    return F.relu(gen_share - real_share), real_share.detach(), gen_share.detach()
+    # Bilateral penalty: over-concentration and over-diffusion are both penalized.
+    return torch.abs(gen_share - real_share), real_share.detach(), gen_share.detach()
+
+
+def calibrate_p_full_density(p_full, sample_logits, target_edge_rate, temp):
+    pred_edge_rate = torch.sigmoid(sample_logits / max(1e-6, float(temp))).mean()
+    target = torch.as_tensor(float(target_edge_rate), dtype=p_full.dtype, device=p_full.device)
+    scale = (target / (pred_edge_rate.detach() + 1e-12)).clamp(0.1, 10.0)
+    return (p_full * scale).clamp(0.0, 1.0)
 
 def top_share(x, top_ratio=0.01):
     x = x.detach().cpu().numpy()
@@ -736,6 +746,16 @@ def run_struct_only_sanity(
         s = float(CFG["struct_logit_clip"])
         logits_full = s * torch.tanh(logits_full / max(1e-6, s))
         p_full = torch.sigmoid(logits_full / CFG["struct_sigmoid_temp"])
+        p_full = calibrate_p_full_density(
+            p_full=p_full,
+            sample_logits=logits_full,
+            target_edge_rate=float(len(train_edges) / max(1.0, (n_nodes * (n_nodes - 1) / 2.0))),
+            temp=CFG["struct_sigmoid_temp"],
+        )
+        density_penalty = float(CFG["density_penalty_weight"]) * F.mse_loss(
+            p_full.mean(),
+            torch.as_tensor(float(len(train_edges) / max(1.0, (n_nodes * (n_nodes - 1) / 2.0))), device=p_full.device),
+        )
         deg_gen = p_full.sum(dim=1) - p_full.diagonal()
 
         L_struct, js_only, _, _, _, _ = compute_L_struct_global(
@@ -749,15 +769,17 @@ def run_struct_only_sanity(
             moment_beta=CFG["struct_moment_beta"],
         )
 
+        L_struct_total = L_struct + density_penalty
+
         opt.zero_grad()
-        L_struct.backward()
+        L_struct_total.backward()
         torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(X_emb.parameters()), grad_clip)
         opt.step()
 
         if ep in (0, steps // 2, steps - 1):
             hub_gen_1 = top_share(deg_gen, top_ratio=CFG["hub_top_ratio"])
             print(
-                f"[Sanity ep {ep:03d}] L_struct={L_struct.item():.4f} js={js_only.item():.4f} "
+                f"[Sanity ep {ep:03d}] L_struct={L_struct_total.item():.4f} js={js_only.item():.4f} density={density_penalty.item():.4f} "
                 f"deg_gen(mean/std/max)={deg_gen.mean().item():.2f}/{deg_gen.std().item():.2f}/{deg_gen.max().item():.2f} "
                 f"hub1%(real/gen)={hub_real_1:.4f}/{hub_gen_1:.4f}"
             )
@@ -780,6 +802,9 @@ def train_once(edge_list, n_nodes, feat_dim, hid_dim, z_dim,
     n_train = int(0.8 * len(edge_list))
     train_edges = edge_list[:n_train]
     test_edges  = edge_list[n_train:]
+
+    max_undirected_edges = n_nodes * (n_nodes - 1) / 2.0
+    target_edge_rate = float(len(train_edges) / max(1.0, max_undirected_edges))
 
     pos_all_set = build_edge_set(edge_list)
     A_norm = make_sparse_adj(n_nodes, train_edges, add_self_loops=True, device=device)
@@ -861,6 +886,16 @@ def train_once(edge_list, n_nodes, feat_dim, hid_dim, z_dim,
             s = float(CFG["struct_logit_clip"])
             logits_full = s * torch.tanh(logits_full / max(1e-6, s))
             p_full = torch.sigmoid(logits_full / CFG["struct_sigmoid_temp"])
+            p_full = calibrate_p_full_density(
+                p_full=p_full,
+                sample_logits=logits,
+                target_edge_rate=target_edge_rate,
+                temp=CFG["struct_sigmoid_temp"],
+            )
+            density_penalty = float(CFG["density_penalty_weight"]) * F.mse_loss(
+                p_full.mean(),
+                torch.as_tensor(target_edge_rate, dtype=p_full.dtype, device=p_full.device),
+            )
             deg_gen = p_full.sum(dim=1) - p_full.diagonal()
 
             L_struct, js_soft, moment_mean, moment_std, _, _ = compute_L_struct_global(
@@ -890,7 +925,7 @@ def train_once(edge_list, n_nodes, feat_dim, hid_dim, z_dim,
             )
             hub_alpha_gate = max(0.0, (float(alpha_struct) - float(CFG["hub_penalty_alpha_start"])) / max(1e-8, float(CFG["hub_penalty_alpha_start"])))
             hub_penalty = float(CFG["hub_penalty_weight"]) * hub_alpha_gate * hub_penalty_raw
-            L_struct_total = L_struct + hub_penalty
+            L_struct_total = L_struct + hub_penalty + density_penalty
             struct_scale = compute_struct_loss_scale(bce, L_struct_total)
             L_struct_scaled = struct_scale * L_struct_total
 
@@ -904,6 +939,7 @@ def train_once(edge_list, n_nodes, feat_dim, hid_dim, z_dim,
                     "L_struct_total": float(L_struct_total.item()),
                     "L_struct_scaled": float(L_struct_scaled.item()),
                     "hub_penalty": float(hub_penalty.item()),
+                    "density_penalty": float(density_penalty.item()),
                     "JS_soft": float(js_soft.item()),
                     "moment_mean": float(moment_mean.item()),
                     "moment_std": float(moment_std.item()),
@@ -941,7 +977,7 @@ def train_once(edge_list, n_nodes, feat_dim, hid_dim, z_dim,
 
                 msg = (f"[seed {seed} | alpha {alpha_struct} | ep {ep:04d}] "
                        f"a_now={a_now:.3g}  bce={bce.item():.4f}  "
-                       f"Ls(base+hub/scaled/js)={L_struct_total.item():.4f}/{L_struct_scaled.item():.4f}/{js_soft.item():.4f}  "
+                       f"Ls(base+hub+density/scaled/js)={L_struct_total.item():.4f}/{L_struct_scaled.item():.4f}/{js_soft.item():.4f}  "
                        f"mom(mean/std)={moment_mean.item():.4f}/{moment_std.item():.4f}  "
                        f"loss={loss.item():.4f}  "
                        f"|g_bce|={g_bce_norm:.2e}  |g_Ls|={g_ls_norm:.2e}  "
@@ -977,6 +1013,12 @@ def train_once(edge_list, n_nodes, feat_dim, hid_dim, z_dim,
             s = float(CFG["struct_logit_clip"])
             logits_full = s * torch.tanh(logits_full / max(1e-6, s))
             p_full = torch.sigmoid(logits_full / CFG["struct_sigmoid_temp"])
+            p_full = calibrate_p_full_density(
+                p_full=p_full,
+                sample_logits=logits_full,
+                target_edge_rate=target_edge_rate,
+                temp=CFG["struct_sigmoid_temp"],
+            )
             deg_gen = p_full.sum(dim=1) - p_full.diagonal()
 
             _, js_soft, _, _, h_real_soft, h_gen_soft = compute_L_struct_global(
