@@ -46,6 +46,11 @@ CFG = {
     "hist_sigma": 0.55,
     "struct_moment_weight": 0.02,
     "struct_moment_beta": 2.0,
+    "struct_loss_auto_scale": True,
+    "struct_loss_scale_min": 0.25,
+    "struct_loss_scale_max": 2.0,
+    "hub_penalty_weight": 0.5,
+    "hub_penalty_alpha_start": 5.0,
 
     # structure branch: smooth squash to avoid hard clamp zero-grad zones
     "struct_logit_clip": 6.0,
@@ -73,6 +78,8 @@ STEP_METRIC_COLUMNS = [
     "step",
     "bce",
     "L_struct_total",
+    "L_struct_scaled",
+    "hub_penalty",
     "JS_soft",
     "moment_mean",
     "moment_std",
@@ -460,6 +467,18 @@ def compute_L_struct_global(
     l_total = js + moment_weight * (m_mean + 0.5 * m_std)
     return l_total, js, m_mean, m_std, h_real.detach(), h_gen.detach()
 
+
+
+def compute_hub_penalty(deg_real, deg_gen, top_ratio=0.01):
+    k_real = max(1, int(len(deg_real) * top_ratio))
+    k_gen = max(1, int(len(deg_gen) * top_ratio))
+    real_top = torch.topk(deg_real, k_real).values
+    gen_top = torch.topk(deg_gen, k_gen).values
+    real_share = real_top.sum() / (deg_real.sum() + 1e-12)
+    gen_share = gen_top.sum() / (deg_gen.sum() + 1e-12)
+    # Only penalize over-concentrated hubs.
+    return F.relu(gen_share - real_share), real_share.detach(), gen_share.detach()
+
 def top_share(x, top_ratio=0.01):
     x = x.detach().cpu().numpy()
     n = len(x)
@@ -481,6 +500,15 @@ def alpha_schedule(ep, epochs, alpha_struct, warmup_frac=0.5, ramp_frac=0.25):
         t = (ep - warmup) / max(1, ramp)
         return alpha_struct * float(t)
     return alpha_struct
+
+
+def compute_struct_loss_scale(bce, l_struct):
+    if not CFG.get("struct_loss_auto_scale", False):
+        return 1.0
+    raw = float(bce.detach().item()) / max(1e-8, float(l_struct.detach().item()))
+    lo = float(CFG.get("struct_loss_scale_min", 0.25))
+    hi = float(CFG.get("struct_loss_scale_max", 2.0))
+    return float(np.clip(raw, lo, hi))
 
 
 def grad_status(named_params, near_zero_thr=1e-8):
@@ -855,6 +883,17 @@ def train_once(edge_list, n_nodes, feat_dim, hid_dim, z_dim,
                     ap_seed=seed + 2026 + ep,
                 )
 
+            hub_penalty_raw, _, _ = compute_hub_penalty(
+                deg_real=deg_real,
+                deg_gen=deg_gen,
+                top_ratio=CFG["hub_top_ratio"],
+            )
+            hub_alpha_gate = max(0.0, (float(alpha_struct) - float(CFG["hub_penalty_alpha_start"])) / max(1e-8, float(CFG["hub_penalty_alpha_start"])))
+            hub_penalty = float(CFG["hub_penalty_weight"]) * hub_alpha_gate * hub_penalty_raw
+            L_struct_total = L_struct + hub_penalty
+            struct_scale = compute_struct_loss_scale(bce, L_struct_total)
+            L_struct_scaled = struct_scale * L_struct_total
+
             deg_gen_mean = float(deg_gen.mean().item())
             deg_gen_std = float(deg_gen.std(unbiased=False).item())
             hub_gen_1 = top_share(deg_gen, top_ratio=CFG["hub_top_ratio"])
@@ -862,7 +901,9 @@ def train_once(edge_list, n_nodes, feat_dim, hid_dim, z_dim,
                 metrics_writer.writerow({
                     "step": ep,
                     "bce": float(bce.item()),
-                    "L_struct_total": float(L_struct.item()),
+                    "L_struct_total": float(L_struct_total.item()),
+                    "L_struct_scaled": float(L_struct_scaled.item()),
+                    "hub_penalty": float(hub_penalty.item()),
                     "JS_soft": float(js_soft.item()),
                     "moment_mean": float(moment_mean.item()),
                     "moment_std": float(moment_std.item()),
@@ -874,12 +915,12 @@ def train_once(edge_list, n_nodes, feat_dim, hid_dim, z_dim,
                 })
 
             a_now = alpha_schedule(ep, epochs, alpha_struct, warmup_frac=warmup_frac, ramp_frac=ramp_frac)
-            loss = bce + a_now * L_struct
+            loss = bce + a_now * L_struct_scaled
 
             do_log = (ep % CFG["log_every"] == 0) or (ep == epochs - 1)
             if do_log:
                 g_bce = torch.autograd.grad(bce, z, retain_graph=True)[0]
-                g_ls  = torch.autograd.grad(L_struct, z, retain_graph=True)[0]
+                g_ls  = torch.autograd.grad(L_struct_scaled, z, retain_graph=True)[0]
 
                 g_bce_norm = g_bce.norm().item()
                 g_ls_norm = g_ls.norm().item()
@@ -900,7 +941,7 @@ def train_once(edge_list, n_nodes, feat_dim, hid_dim, z_dim,
 
                 msg = (f"[seed {seed} | alpha {alpha_struct} | ep {ep:04d}] "
                        f"a_now={a_now:.3g}  bce={bce.item():.4f}  "
-                       f"Ls(total/js)={L_struct.item():.4f}/{js_soft.item():.4f}  "
+                       f"Ls(base+hub/scaled/js)={L_struct_total.item():.4f}/{L_struct_scaled.item():.4f}/{js_soft.item():.4f}  "
                        f"mom(mean/std)={moment_mean.item():.4f}/{moment_std.item():.4f}  "
                        f"loss={loss.item():.4f}  "
                        f"|g_bce|={g_bce_norm:.2e}  |g_Ls|={g_ls_norm:.2e}  "
@@ -1190,6 +1231,33 @@ def run_grid_sweep(args, run_dir=None, save_plots=False):
         CFG["run_struct_only_sanity"] = base_run_sanity
 
 
+def write_alpha_summary_table(all_alpha_results, out_path):
+    rows = []
+    for a in sorted(all_alpha_results.keys(), key=float):
+        results = all_alpha_results[a]
+        auc_m, auc_s = summarize(results, "AUC")
+        ap_m, ap_s = summarize(results, "AP")
+        js_m, js_s = summarize(results, "L_struct")
+        hub_m, hub_s = summarize(results, "hub_top1%_share")
+        rows.append({
+            "alpha": float(a),
+            "auc_mean": auc_m, "auc_std": auc_s,
+            "ap_mean": ap_m, "ap_std": ap_s,
+            "js_soft_mean": js_m, "js_soft_std": js_s,
+            "hub1pct_mean": hub_m, "hub1pct_std": hub_s,
+        })
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("| alpha | AUC(mean±std) | AP(mean±std) | JS-soft(mean±std) | hub1%(mean±std) |\n")
+        f.write("|---:|---:|---:|---:|---:|\n")
+        for r in rows:
+            f.write(
+                f"| {r['alpha']:.2f} | {r['auc_mean']:.4f}±{r['auc_std']:.4f} | "
+                f"{r['ap_mean']:.4f}±{r['ap_std']:.4f} | "
+                f"{r['js_soft_mean']:.4f}±{r['js_soft_std']:.4f} | "
+                f"{r['hub1pct_mean']:.4f}±{r['hub1pct_std']:.4f} |\n"
+            )
+
 def main(metrics_csv_base="per_step_metrics.csv", run_dir=None, save_plots=False):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -1301,6 +1369,9 @@ def main(metrics_csv_base="per_step_metrics.csv", run_dir=None, save_plots=False
     print("best    hard h_real:", rb["h_real_hard"])
     print("best    hard h_gen :", rb["h_gen_hard"])
     if run_dir is not None:
+        table_path = os.path.join(run_dir, "alpha_summary_table.md")
+        write_alpha_summary_table(all_alpha_results, table_path)
+        print(f"[Summary] alpha table saved: {table_path}")
         print(f"\nArtifacts saved under: {run_dir}")
 
 if __name__ == "__main__":
